@@ -479,7 +479,7 @@ export function NewIssueDialog() {
     (draft: IssueDraft) => {
       if (draftTimer.current) clearTimeout(draftTimer.current);
       draftTimer.current = setTimeout(() => {
-        if (draft.title.trim()) saveDraft(draft);
+        if (draft.title.trim() || draft.description.trim()) saveDraft(draft);
       }, DEBOUNCE_MS);
     },
     [],
@@ -1682,7 +1682,7 @@ export function NewIssueDialog() {
             <Button
               size="sm"
               className="min-w-[8.5rem] disabled:opacity-100"
-              disabled={!title.trim() || createIssue.isPending}
+              disabled={(!title.trim() && !description.trim()) || createIssue.isPending}
               onClick={handleSubmit}
               aria-busy={createIssue.isPending}
             >
