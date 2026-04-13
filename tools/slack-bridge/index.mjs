@@ -106,6 +106,37 @@ async function pollCompletedIssues(ws) {
     companyIds.add(routing.companyId);
   }
 
+  // Post new agent comments to Slack threads FIRST (before cleaning up done issues)
+  for (const companyId of companyIds) {
+    try {
+      const comments = getNewAgentComments(companyId);
+      for (const c of comments) {
+        if (ws.postedAgentComments.has(c.id)) continue;
+
+        for (const [ts, issueId] of ws.threadToIssue) {
+          if (issueId === c.issueId && c.snippet) {
+            const pending = ws.pendingCheckmarks.get(issueId);
+            if (pending) {
+              try {
+                await ws.slack.chat.postMessage({
+                  channel: pending.channel,
+                  thread_ts: ts,
+                  text: c.snippet.substring(0, 500),
+                });
+                console.log(`  [${ws.name}] -> slack thread ${c.identifier}`);
+              } catch (e) {
+                console.error("Failed to post to thread:", e.message);
+              }
+            }
+            ws.postedAgentComments.add(c.id);
+            break;
+          }
+        }
+      }
+    } catch {}
+  }
+
+  // Then check for done/blocked status and clean up maps
   for (const companyId of companyIds) {
     try {
       const result = execSync(
@@ -149,36 +180,6 @@ async function pollCompletedIssues(ws) {
     } catch (e) {
       console.error(`[${ws.name}] Poll error:`, e.message);
     }
-  }
-
-  // Check for new agent comments on tracked issues -> post to Slack thread
-  for (const companyId of companyIds) {
-    try {
-      const comments = getNewAgentComments(companyId);
-      for (const c of comments) {
-        if (ws.postedAgentComments.has(c.id)) continue;
-
-        for (const [ts, issueId] of ws.threadToIssue) {
-          if (issueId === c.issueId && c.snippet) {
-            const pending = ws.pendingCheckmarks.get(issueId);
-            if (pending) {
-              try {
-                await ws.slack.chat.postMessage({
-                  channel: pending.channel,
-                  thread_ts: ts,
-                  text: c.snippet.substring(0, 500),
-                });
-                console.log(`  [${ws.name}] -> slack thread ${c.identifier}`);
-              } catch (e) {
-                console.error("Failed to post to thread:", e.message);
-              }
-            }
-            ws.postedAgentComments.add(c.id);
-            break;
-          }
-        }
-      }
-    } catch {}
   }
 }
 
