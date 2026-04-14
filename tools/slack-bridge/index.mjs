@@ -1,6 +1,9 @@
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import { execSync } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { WORKSPACES, PAPERCLIP_CLI, POLL_INTERVAL_MS } from "./config.mjs";
 
 // --- Shared caches (channel/user names are global across workspaces) ---
@@ -35,6 +38,15 @@ function getImageFiles(event) {
 
 const PAPERCLIP_API = "http://localhost:3100";
 
+function getPaperclipBoardToken() {
+  try {
+    const authPath = join(homedir(), ".paperclip", "auth.json");
+    const auth = JSON.parse(readFileSync(authPath, "utf-8"));
+    const cred = auth.credentials?.[PAPERCLIP_API] || auth.credentials?.["http://localhost:3100"];
+    return cred?.token || null;
+  } catch { return null; }
+}
+
 async function uploadSlackImage(botToken, file, companyId) {
   try {
     const res = await fetch(file.url, {
@@ -44,11 +56,17 @@ async function uploadSlackImage(botToken, file, companyId) {
       console.error(`Failed to download ${file.name}: ${res.status}`);
       return null;
     }
+    const boardToken = getPaperclipBoardToken();
+    if (!boardToken) {
+      console.error("No Paperclip board token found in ~/.paperclip/auth.json");
+      return null;
+    }
     const buffer = Buffer.from(await res.arrayBuffer());
     const form = new FormData();
     form.append("file", new Blob([buffer], { type: file.mimetype }), file.name);
     const upload = await fetch(`${PAPERCLIP_API}/api/companies/${companyId}/assets/images`, {
       method: "POST",
+      headers: { Authorization: `Bearer ${boardToken}` },
       body: form,
     });
     if (!upload.ok) {
