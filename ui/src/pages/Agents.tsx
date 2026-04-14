@@ -279,9 +279,9 @@ export function Agents() {
 
       {/* Org chart view */}
       {effectiveView === "org" && filteredOrg.length > 0 && (
-        <div className="border border-border py-1">
-          {filteredOrg.map((node) => (
-            <OrgTreeNode key={node.id} node={node} depth={0} agentMap={agentMap} liveRunByAgent={liveRunByAgent} tab={tab} />
+        <div className="border border-border py-1 font-mono">
+          {filteredOrg.map((node, i) => (
+            <OrgTreeNode key={node.id} node={node} depth={0} agentMap={agentMap} liveRunByAgent={liveRunByAgent} tab={tab} isLast={i === filteredOrg.length - 1} />
           ))}
         </div>
       )}
@@ -307,77 +307,83 @@ function OrgTreeNode({
   agentMap,
   liveRunByAgent,
   tab,
+  prefix,
+  isLast,
 }: {
   node: OrgNode;
   depth: number;
   agentMap: Map<string, Agent>;
   liveRunByAgent: Map<string, { runId: string; liveCount: number }>;
   tab: FilterTab;
+  prefix?: string;
+  isLast?: boolean;
 }) {
   const agent = agentMap.get(node.id);
-
   const statusColor = agentStatusDot[node.status] ?? agentStatusDotDefault;
 
+  // Build the ASCII tree connector for this node
+  const connector = depth === 0 ? "" : isLast ? "└── " : "├── ";
+  // Prefix for children: if this node is last, its children get spaces; otherwise a vertical pipe
+  const childPrefix = depth === 0 ? "" : (prefix ?? "") + (isLast ? "    " : "│   ");
+  const currentPrefix = prefix ?? "";
+
+  const skills = (agent?.adapterConfig as Record<string, unknown> | undefined)?.paperclipSkillSync as { desiredSkills?: string[] } | undefined;
+  const skillNames = skills?.desiredSkills?.map((s: string) => s.split("/").pop()).filter(Boolean) ?? [];
+
   return (
-    <div style={{ paddingLeft: depth * 24 }}>
+    <>
       <Link
         to={agent ? agentUrl(agent) : `/agents/${node.id}`}
-        className={cn("flex items-center gap-3 px-3 py-2 hover:bg-accent/30 transition-colors w-full text-left no-underline text-inherit", agent?.pausedAt && tab !== "paused" && "opacity-50")}
+        className={cn(
+          "flex items-center gap-2 px-3 py-0.5 hover:bg-accent/30 transition-colors w-full text-left no-underline text-inherit group",
+          agent?.pausedAt && tab !== "paused" && "opacity-50",
+        )}
       >
-        <span className="relative flex h-2.5 w-2.5 shrink-0">
+        {/* ASCII tree prefix */}
+        {depth > 0 && (
+          <span className="text-muted-foreground/50 font-mono text-xs whitespace-pre select-none shrink-0">
+            {currentPrefix}{connector}
+          </span>
+        )}
+        {/* Status dot */}
+        <span className="relative flex h-2 w-2 shrink-0">
           <span className={`absolute inline-flex h-full w-full rounded-full ${statusColor}`} />
         </span>
-        <div className="flex-1 min-w-0">
-          <span className="text-sm font-medium">{node.name}</span>
-          <span className="text-xs text-muted-foreground ml-2">
-            {roleLabels[node.role] ?? node.role}
-            {agent?.title ? ` - ${agent.title}` : ""}
+        {/* Agent name */}
+        <span className="text-sm font-medium shrink-0">{node.name}</span>
+        {/* Skills (muted, truncated) */}
+        {skillNames.length > 0 && (
+          <span className="hidden sm:inline text-[11px] text-muted-foreground/60 font-mono truncate">
+            [{skillNames.slice(0, 3).join(", ")}{skillNames.length > 3 ? ` +${skillNames.length - 3}` : ""}]
           </span>
-        </div>
-        <div className="flex items-center gap-3 shrink-0">
-          <span className="sm:hidden">
-            {liveRunByAgent.has(node.id) ? (
-              <LiveRunIndicator
-                agentRef={agent ? agentRouteRef(agent) : node.id}
-                runId={liveRunByAgent.get(node.id)!.runId}
-                liveCount={liveRunByAgent.get(node.id)!.liveCount}
-              />
-            ) : (
-              <StatusBadge status={node.status} />
-            )}
+        )}
+        {/* Right side: live indicator + status */}
+        <div className="flex items-center gap-2 ml-auto shrink-0">
+          {liveRunByAgent.has(node.id) && (
+            <LiveRunIndicator
+              agentRef={agent ? agentRouteRef(agent) : node.id}
+              runId={liveRunByAgent.get(node.id)!.runId}
+              liveCount={liveRunByAgent.get(node.id)!.liveCount}
+            />
+          )}
+          <span className="hidden sm:flex w-16 justify-end">
+            <StatusBadge status={node.status} />
           </span>
-          <div className="hidden sm:flex items-center gap-3">
-            {liveRunByAgent.has(node.id) && (
-              <LiveRunIndicator
-                agentRef={agent ? agentRouteRef(agent) : node.id}
-                runId={liveRunByAgent.get(node.id)!.runId}
-                liveCount={liveRunByAgent.get(node.id)!.liveCount}
-              />
-            )}
-            {agent && (
-              <>
-                <span className="text-xs text-muted-foreground font-mono w-14 text-right">
-                  {getAdapterLabel(agent.adapterType)}
-                </span>
-                <span className="text-xs text-muted-foreground w-16 text-right">
-                  {agent.lastHeartbeatAt ? relativeTime(agent.lastHeartbeatAt) : "—"}
-                </span>
-              </>
-            )}
-            <span className="w-20 flex justify-end">
-              <StatusBadge status={node.status} />
-            </span>
-          </div>
         </div>
       </Link>
-      {node.reports && node.reports.length > 0 && (
-        <div className="border-l border-border/50 ml-4">
-          {node.reports.map((child) => (
-            <OrgTreeNode key={child.id} node={child} depth={depth + 1} agentMap={agentMap} liveRunByAgent={liveRunByAgent} tab={tab} />
-          ))}
-        </div>
-      )}
-    </div>
+      {node.reports?.map((child, i) => (
+        <OrgTreeNode
+          key={child.id}
+          node={child}
+          depth={depth + 1}
+          agentMap={agentMap}
+          liveRunByAgent={liveRunByAgent}
+          tab={tab}
+          prefix={childPrefix}
+          isLast={i === node.reports.length - 1}
+        />
+      ))}
+    </>
   );
 }
 
