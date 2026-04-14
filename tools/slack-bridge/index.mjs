@@ -26,11 +26,51 @@ async function getUserName(slack, id) {
   } catch { return id; }
 }
 
-async function getFileUrls(event) {
+function getImageFiles(event) {
   if (!event.files || event.files.length === 0) return [];
   return event.files
     .filter(f => f.mimetype && f.mimetype.startsWith("image/"))
-    .map(f => ({ name: f.name || "image", url: f.url_private }));
+    .map(f => ({ name: f.name || "image", url: f.url_private, mimetype: f.mimetype }));
+}
+
+const PAPERCLIP_API = "http://localhost:3100";
+
+async function uploadSlackImage(botToken, file, companyId) {
+  try {
+    const res = await fetch(file.url, {
+      headers: { Authorization: `Bearer ${botToken}` },
+    });
+    if (!res.ok) {
+      console.error(`Failed to download ${file.name}: ${res.status}`);
+      return null;
+    }
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const form = new FormData();
+    form.append("file", new Blob([buffer], { type: file.mimetype }), file.name);
+    const upload = await fetch(`${PAPERCLIP_API}/api/companies/${companyId}/assets/images`, {
+      method: "POST",
+      body: form,
+    });
+    if (!upload.ok) {
+      console.error(`Failed to upload ${file.name}: ${upload.status} ${await upload.text()}`);
+      return null;
+    }
+    const asset = await upload.json();
+    return { name: file.name, path: asset.contentPath };
+  } catch (e) {
+    console.error(`Image transfer failed for ${file.name}:`, e.message);
+    return null;
+  }
+}
+
+async function transferImages(botToken, event, companyId) {
+  const files = getImageFiles(event);
+  if (files.length === 0) return "";
+  const results = await Promise.all(files.map(f => uploadSlackImage(botToken, f, companyId)));
+  return results
+    .filter(Boolean)
+    .map(r => `![${r.name}](${r.path})`)
+    .join("\n");
 }
 
 // --- Routing ---
@@ -206,8 +246,8 @@ function createMessageHandler(ws) {
 
     const userName = await getUserName(ws.slack, event.user);
     const text = event.text || "(no text)";
-    const files = await getFileUrls(event);
-    const imagesMd = files.map(f => "![" + f.name + "](" + f.url + ")").join("\n");
+
+    const imagesMd = await transferImages(ws.botToken, event, routing.companyId);
 
     // Thread reply -> add comment to existing issue
     if (event.thread_ts && ws.threadToIssue.has(event.thread_ts)) {
@@ -230,6 +270,7 @@ function createMessageHandler(ws) {
     ].join("\n");
 
     const issue = createIssue(description, routing);
+    if (issue && imagesMd) console.log(`  [${ws.name}] uploaded ${getImageFiles(event).length} image(s)`);
     if (issue) {
       console.log(`  [${ws.name}] -> ${issue.identifier}`);
       try { await ws.slack.reactions.add({ channel: event.channel, name: "eyes", timestamp: event.ts }); } catch {}
@@ -260,6 +301,7 @@ for (const wsConfig of WORKSPACES) {
     config: wsConfig,
     slack,
     socket,
+    botToken,
     pendingCheckmarks: new Map(),
     threadToIssue: new Map(),
     notifiedBlocked: new Set(),
