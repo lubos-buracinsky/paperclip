@@ -191,7 +191,8 @@ function createMessageHandler(ws) {
 
   return async ({ event, body, ack }) => {
     await ack();
-    if (event.bot_id || event.subtype) return;
+    if (event.bot_id) return;
+    if (event.subtype && event.subtype !== "file_share") return;
     if (ws.config.watchChannels.length > 0 && !ws.config.watchChannels.includes(event.channel)) return;
     if (processed.has(event.ts)) return;
     processed.add(event.ts);
