@@ -103,6 +103,8 @@ if [[ -z "${PAPERCLIP_API_URL:-}" || -z "${PAPERCLIP_API_KEY:-}" || -z "${PAPERC
 fi
 
 curl -sS -X PATCH \
+  --connect-timeout 10 \
+  --max-time 30 \
   "$PAPERCLIP_API_URL/api/issues/$issue_id" \
   -H "Authorization: Bearer $PAPERCLIP_API_KEY" \
   -H "X-Paperclip-Run-Id: $PAPERCLIP_RUN_ID" \
