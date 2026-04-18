@@ -1,10 +1,47 @@
 import { SocketModeClient } from "@slack/socket-mode";
 import { WebClient } from "@slack/web-api";
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, dirname } from "node:path";
 import { WORKSPACES, PAPERCLIP_CLI, POLL_INTERVAL_MS } from "./config.mjs";
+
+// --- State file (per-channel last seen ts for post-mortem backfill) ---
+
+const STATE_FILE = join(homedir(), ".slack-bridge-state.json");
+const BACKFILL_FALLBACK_HOURS = 24;
+
+function loadState() {
+  try {
+    return JSON.parse(readFileSync(STATE_FILE, "utf-8"));
+  } catch { return {}; }
+}
+
+function saveState(state) {
+  try {
+    mkdirSync(dirname(STATE_FILE), { recursive: true });
+    writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
+  } catch (e) {
+    console.error("Failed to persist state:", e.message);
+  }
+}
+
+const state = loadState();
+
+function stateKey(wsName, channel) { return `${wsName}:${channel}`; }
+
+function getLastSeen(wsName, channel) {
+  return state[stateKey(wsName, channel)] || null;
+}
+
+function updateLastSeen(wsName, channel, ts) {
+  const key = stateKey(wsName, channel);
+  const prev = state[key];
+  if (!prev || parseFloat(ts) > parseFloat(prev)) {
+    state[key] = ts;
+    saveState(state);
+  }
+}
 
 // --- Shared caches (channel/user names are global across workspaces) ---
 
@@ -402,69 +439,124 @@ function createReactionHandler(ws) {
   };
 }
 
-// --- Per-workspace message handler ---
+// --- Message processing (shared by live events and backfill) ---
+
+async function processMessageEvent(ws, event, { source = "live" } = {}) {
+  if (event.bot_id) return;
+  if (event.subtype && event.subtype !== "file_share") return;
+  if (ws.config.watchChannels.length > 0 && !ws.config.watchChannels.includes(event.channel)) return;
+  if (ws.processed.has(event.ts)) return;
+  ws.processed.add(event.ts);
+  if (ws.processed.size > 1000) {
+    const arr = [...ws.processed];
+    arr.slice(0, arr.length - 1000).forEach(ts => ws.processed.delete(ts));
+  }
+
+  const routing = resolveRouting(ws.config, event.channel);
+  if (!routing) return;
+
+  updateLastSeen(ws.name, event.channel, event.ts);
+
+  const userName = await getUserName(ws.slack, event.user);
+  const text = event.text || "(no text)";
+
+  const reactionOnly = (ws.config.reactionTriggerChannels || []).includes(event.channel);
+
+  const imagesMd = await transferImages(ws.botToken, event, routing.companyId);
+
+  if (event.thread_ts && ws.threadToIssue.has(event.thread_ts)) {
+    if (reactionOnly) return;
+    const issueId = ws.threadToIssue.get(event.thread_ts);
+    console.log(`  [${ws.name}] thread reply -> comment on issue${source === "backfill" ? " (backfill)" : ""}`);
+    addComment(issueId, `**${userName} (Slack):** ${text}${imagesMd ? "\n" + imagesMd : ""}`);
+    return;
+  }
+
+  if (reactionOnly) {
+    if (source === "live") {
+      console.log(`  [${ws.name}] reaction-only channel, waiting for :${ws.config.triggerEmoji || "robot_face"}: trigger`);
+    }
+    return;
+  }
+
+  const channelName = await getChannelName(ws.slack, event.channel);
+  const tag = source === "backfill" ? " (backfill)" : "";
+  console.log(`[${ws.name}/${channelName}]${tag} ${userName}: ${text.substring(0, 100)}`);
+
+  const description = [
+    "## Ze Slacku", "",
+    `**Kanal:** #${channelName}`,
+    `**Od:** ${userName}`,
+    `**Cas:** ${new Date(parseFloat(event.ts) * 1000).toISOString()}`,
+    ...(source === "backfill" ? [`**Zdroj:** backfill (post-mortem)`] : []),
+    "", "## Zprava", "", text, ...(imagesMd ? ["", "## Obrazky", "", imagesMd] : []),
+  ].join("\n");
+
+  const issue = createIssue(description, routing);
+  if (issue && imagesMd) console.log(`  [${ws.name}] uploaded ${getImageFiles(event).length} image(s)`);
+  if (issue) {
+    console.log(`  [${ws.name}] -> ${issue.identifier}`);
+    try { await ws.slack.reactions.add({ channel: event.channel, name: "eyes", timestamp: event.ts }); } catch {}
+    ws.pendingCheckmarks.set(issue.id, { channel: event.channel, ts: event.ts, identifier: issue.identifier, routing });
+    ws.threadToIssue.set(event.ts, issue.id);
+  }
+}
 
 function createMessageHandler(ws) {
-  const processed = new Set();
-
-  return async ({ event, body, ack }) => {
+  return async ({ event, ack }) => {
     await ack();
-    if (event.bot_id) return;
-    if (event.subtype && event.subtype !== "file_share") return;
-    if (ws.config.watchChannels.length > 0 && !ws.config.watchChannels.includes(event.channel)) return;
-    if (processed.has(event.ts)) return;
-    processed.add(event.ts);
-    if (processed.size > 1000) {
-      const arr = [...processed];
-      arr.slice(0, arr.length - 1000).forEach(ts => processed.delete(ts));
-    }
-
-    const routing = resolveRouting(ws.config, event.channel);
-    if (!routing) return; // unknown channel in direct mode
-
-    const userName = await getUserName(ws.slack, event.user);
-    const text = event.text || "(no text)";
-
-    // Channels that require explicit :robot_face: reaction to create issue/comment
-    const reactionOnly = (ws.config.reactionTriggerChannels || []).includes(event.channel);
-
-    const imagesMd = await transferImages(ws.botToken, event, routing.companyId);
-
-    // Thread reply -> add comment to existing issue (skip for reaction-only channels)
-    if (event.thread_ts && ws.threadToIssue.has(event.thread_ts)) {
-      if (reactionOnly) return; // wait for :robot_face: reaction
-      const issueId = ws.threadToIssue.get(event.thread_ts);
-      console.log(`  [${ws.name}] thread reply -> comment on issue`);
-      addComment(issueId, `**${userName} (Slack):** ${text}${imagesMd ? "\n" + imagesMd : ""}`);
-      return;
-    }
-
-    // New message -> create issue (skip for reaction-only channels)
-    if (reactionOnly) {
-      console.log(`  [${ws.name}] reaction-only channel, waiting for :${ws.config.triggerEmoji || "robot_face"}: trigger`);
-      return;
-    }
-
-    const channelName = await getChannelName(ws.slack, event.channel);
-    console.log(`[${ws.name}/${channelName}] ${userName}: ${text.substring(0, 100)}`);
-
-    const description = [
-      "## Ze Slacku", "",
-      `**Kanal:** #${channelName}`,
-      `**Od:** ${userName}`,
-      `**Cas:** ${new Date(parseFloat(event.ts) * 1000).toISOString()}`,
-      "", "## Zprava", "", text, ...(imagesMd ? ["", "## Obrazky", "", imagesMd] : []),
-    ].join("\n");
-
-    const issue = createIssue(description, routing);
-    if (issue && imagesMd) console.log(`  [${ws.name}] uploaded ${getImageFiles(event).length} image(s)`);
-    if (issue) {
-      console.log(`  [${ws.name}] -> ${issue.identifier}`);
-      try { await ws.slack.reactions.add({ channel: event.channel, name: "eyes", timestamp: event.ts }); } catch {}
-      ws.pendingCheckmarks.set(issue.id, { channel: event.channel, ts: event.ts, identifier: issue.identifier, routing });
-      ws.threadToIssue.set(event.ts, issue.id);
-    }
+    await processMessageEvent(ws, event, { source: "live" });
   };
+}
+
+// --- Post-mortem backfill (direct routing only) ---
+
+async function backfillChannel(ws, channel) {
+  const lastSeen = getLastSeen(ws.name, channel);
+  const fallback = (Date.now() / 1000) - BACKFILL_FALLBACK_HOURS * 3600;
+  const oldest = lastSeen ? parseFloat(lastSeen) : fallback;
+
+  let cursor = undefined;
+  let batches = 0;
+  const collected = [];
+  do {
+    let res;
+    try {
+      res = await ws.slack.conversations.history({
+        channel,
+        oldest: String(oldest),
+        limit: 200,
+        cursor,
+      });
+    } catch (e) {
+      console.error(`[${ws.name}] backfill history failed for ${channel}:`, e.message);
+      return;
+    }
+    if (!res.ok) return;
+    for (const msg of res.messages || []) {
+      // Slack returns messages newest-first; collect and reverse
+      if (parseFloat(msg.ts) > parseFloat(lastSeen || "0")) collected.push(msg);
+    }
+    cursor = res.response_metadata?.next_cursor || undefined;
+    batches++;
+  } while (cursor && batches < 5);
+
+  collected.sort((a, b) => parseFloat(a.ts) - parseFloat(b.ts));
+  if (collected.length === 0) return;
+
+  console.log(`[${ws.name}] backfill ${channel}: ${collected.length} missed message(s) since ${lastSeen || "fallback"}`);
+  for (const msg of collected) {
+    await processMessageEvent(ws, { ...msg, channel }, { source: "backfill" });
+  }
+}
+
+async function backfillWorkspace(ws) {
+  if (ws.config.routing !== "direct") return; // triage uses reaction trigger; out of scope for v1
+  const channelIds = Object.keys(ws.config.channels || {});
+  for (const channel of channelIds) {
+    try { await backfillChannel(ws, channel); }
+    catch (e) { console.error(`[${ws.name}] backfill error in ${channel}:`, e.message); }
+  }
 }
 
 // --- Startup ---
@@ -492,12 +584,19 @@ for (const wsConfig of WORKSPACES) {
     pendingCheckmarks: new Map(),
     threadToIssue: new Map(),
     notifiedBlocked: new Set(),
+    processed: new Set(),
+    backfillRunning: false,
   };
 
   socket.on("message", createMessageHandler(ws));
   socket.on("reaction_added", createReactionHandler(ws));
   socket.on("connected", () => {
     console.log(`[${ws.name}] Connected (${wsConfig.routing} routing)`);
+    if (ws.backfillRunning) return;
+    ws.backfillRunning = true;
+    backfillWorkspace(ws)
+      .catch(e => console.error(`[${ws.name}] backfill crashed:`, e.message))
+      .finally(() => { ws.backfillRunning = false; });
   });
   socket.on("error", (err) => console.error(`[${ws.name}] Socket error:`, err.message));
 
